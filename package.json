@@ -1,0 +1,18 @@
+{
+  "name": "pollpulse",
+  "version": "1.0.0",
+  "private": true,
+  "description": "System Design Project 2: live voting at scale with sharding, replication and tunable consistency",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 tests/e2e.test.mjs",
+    "demo:double-vote": "node scripts/double-vote-demo.mjs",
+    "demo:replication": "node scripts/replication-lag-demo.mjs",
+    "demo:consistency": "node scripts/consistency-demo.mjs",
+    "demo:shard-key": "node scripts/shard-key-demo.mjs",
+    "demo:failover": "node scripts/failover-demo.mjs",
+    "demo:partition": "node scripts/partition-demo.mjs",
+    "demo:indexes": "node scripts/index-benchmark.mjs"
+  },
+  "engines": { "node": ">=20" },
+  "license": "MIT"
+}

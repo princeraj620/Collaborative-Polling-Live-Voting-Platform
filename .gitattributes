@@ -1,0 +1,4 @@
+# Keep LF line endings everywhere: these files are mounted into Linux
+# containers (SQL init scripts, Nginx templates) even when cloned on Windows.
+* text=auto eol=lf
+*.png binary

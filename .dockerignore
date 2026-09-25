@@ -1,0 +1,10 @@
+# Keeps the Docker build context small for the nginx image (context = repo root).
+**/node_modules
+**/dist
+.git
+docs
+load-tests
+tests
+scripts
+db
+api

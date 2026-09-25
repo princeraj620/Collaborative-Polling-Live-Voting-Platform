@@ -1,0 +1,74 @@
+# Rendered at container start by the nginx image (envsubst on EDGE_* only).
+
+limit_req_zone $binary_remote_addr zone=per_ip:10m rate=${EDGE_RATE_LIMIT_RPS}r/s;
+limit_req_status 429;
+
+log_format upstream_log '$remote_addr [$time_local] "$request" $status '
+                        'upstream=$upstream_addr rt=$request_time rid=$request_id';
+
+# Three stateless API servers, one per simulated region.
+upstream api_servers {
+    zone api_servers 64k;
+    least_conn;
+    server api1:3000 max_fails=3 fail_timeout=10s;
+    server api2:3000 max_fails=3 fail_timeout=10s;
+    server api3:3000 max_fails=3 fail_timeout=10s;
+    keepalive 64;
+}
+
+server {
+    listen 80;
+    server_name _;
+    access_log /var/log/nginx/access.log upstream_log;
+
+    gzip on;
+    gzip_types application/json text/css application/javascript image/svg+xml;
+    gzip_min_length 1024;
+    client_max_body_size 32k;
+
+    # ---- Live results: Server-Sent Events --------------------------------
+    # A stream stays open for as long as the viewer watches, so: no buffering
+    # (send each event immediately), long timeouts, and no edge rate limit
+    # beyond the initial connection.
+    location ~ ^/api/polls/[^/]+/stream$ {
+        limit_req zone=per_ip burst=${EDGE_RATE_LIMIT_BURST} nodelay;
+        proxy_pass http://api_servers;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Request-Id $request_id;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+        gzip off;
+    }
+
+    # ---- API ---------------------------------------------------------------
+    location /api/ {
+        limit_req zone=per_ip burst=${EDGE_RATE_LIMIT_BURST} nodelay;
+        proxy_pass http://api_servers;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Request-Id $request_id;
+        proxy_next_upstream error timeout http_502 http_503;
+        proxy_next_upstream_tries 2;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 15s;
+    }
+
+    # ---- React app -----------------------------------------------------------
+    root /usr/share/nginx/html;
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        try_files $uri =404;
+    }
+    location / {
+        add_header Cache-Control "no-cache";
+        try_files $uri /index.html;
+    }
+}

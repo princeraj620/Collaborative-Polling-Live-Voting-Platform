@@ -1,0 +1,21 @@
+{
+  "name": "pollpulse-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PollPulse API: live voting on PostgreSQL + a sharded MongoDB cluster",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "worker": "node src/worker.js",
+    "dev": "node --watch src/server.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "express": "^5.1.0",
+    "ioredis": "^5.6.1",
+    "jsonwebtoken": "^9.0.2",
+    "mongodb": "^6.17.0",
+    "pg": "^8.16.0"
+  },
+  "license": "MIT"
+}

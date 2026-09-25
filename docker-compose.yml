@@ -1,0 +1,259 @@
+# ---------------------------------------------------------------------------
+# PollPulse: live voting at scale
+#
+#   docker compose up --build -d          start everything (about 17 containers)
+#   open http://localhost:8080
+#
+# Topology
+#   browser -> nginx -> api1 (Mumbai) | api2 (Frankfurt) | api3 (Virginia)
+#
+#   PostgreSQL  pg-primary --WAL stream--> pg-replica        (polls, users, search)
+#   MongoDB     mongos -> shard-a [a1 Mumbai*, a2 Frankfurt, a3 Virginia]
+#                      -> shard-b [b1 Mumbai*, b2 Frankfurt, b3 Virginia]
+#               cfg1 (config server)                          (* = preferred primary)
+#   Redis       cache, rate limits, live stats
+#   worker      closes polls with an exact recount, syncs trending counts
+#
+# The three "regions" are simulated: every container runs on your machine,
+# but each replica-set member and API server is tagged with a region.
+# ---------------------------------------------------------------------------
+name: pollpulse
+
+x-mongod: &mongod
+  image: mongo:7.0
+  restart: unless-stopped
+  # Each mongod gets a small cache (--wiredTigerCacheSizeGB 0.25 below),
+  # because 7 of them share one machine.
+  healthcheck:
+    test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand({ ping: 1 }).ok"]
+    interval: 5s
+    timeout: 5s
+    retries: 30
+
+x-api-env: &api-env
+  NODE_ENV: production
+  PORT: "3000"
+  PG_PRIMARY_URL: postgres://pollpulse:pollpulse@pg-primary:5432/pollpulse
+  PG_REPLICA_URL: postgres://pollpulse:pollpulse@pg-replica:5432/pollpulse
+  READ_YOUR_WRITES: ${READ_YOUR_WRITES:-on}
+  MONGO_URL: mongodb://mongos:27017
+  MONGO_SHARD_URIS: shard-a=mongodb://a1:27017,a2:27017,a3:27017/?replicaSet=shard-a;shard-b=mongodb://b1:27017,b2:27017,b3:27017/?replicaSet=shard-b
+  VOTE_WRITE_CONCERN: ${VOTE_WRITE_CONCERN:-majority}
+  VOTE_WRITE_TIMEOUT_MS: ${VOTE_WRITE_TIMEOUT_MS:-5000}
+  VOTE_TIMEOUT_MS: ${VOTE_TIMEOUT_MS:-8000}
+  COUNTER_SHARDS: ${COUNTER_SHARDS:-16}
+  REDIS_URL: redis://redis:6379
+  JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+  CACHE_RESULTS_TTL_MS: ${CACHE_RESULTS_TTL_MS:-1000}
+  LIVE_RESULTS_INTERVAL_MS: ${LIVE_RESULTS_INTERVAL_MS:-1000}
+  RATE_LIMIT_FAIL_MODE: ${RATE_LIMIT_FAIL_MODE:-open}
+  RL_VOTES_CAPACITY: ${RL_VOTES_CAPACITY:-5}
+  RL_VOTES_REFILL: ${RL_VOTES_REFILL:-1}
+  RL_LOGIN_CAPACITY: ${RL_LOGIN_CAPACITY:-20}
+  RL_LOGIN_REFILL: ${RL_LOGIN_REFILL:-2}
+  RL_CREATE_CAPACITY: ${RL_CREATE_CAPACITY:-5}
+  RL_CREATE_REFILL: ${RL_CREATE_REFILL:-0.1}
+
+x-api: &api
+  build: ./api
+  image: pollpulse-api:local
+  restart: unless-stopped
+  depends_on:
+    pg-primary:
+      condition: service_healthy
+    pg-replica:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    mongo-init:
+      condition: service_completed_successfully
+
+services:
+  # ------------------------------------------------------------------ PostgreSQL
+  pg-primary:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pollpulse
+      POSTGRES_PASSWORD: pollpulse
+      POSTGRES_DB: pollpulse
+      REPLICATION_PASSWORD: replicator
+    command: ["postgres", "-c", "wal_level=replica", "-c", "max_wal_senders=5", "-c", "max_connections=200"]
+    volumes:
+      - pg-primary:/var/lib/postgresql/data
+      # Runs once on an empty volume: replication user, schema, 200k seed polls.
+      - ./db/postgres/00-replication.sh:/docker-entrypoint-initdb.d/00-replication.sh:ro
+      - ./db/postgres/01-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./db/postgres/02-seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U pollpulse -d pollpulse"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+
+  pg-replica:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    user: postgres
+    entrypoint: ["/bin/sh", "/replica-entrypoint.sh"]
+    environment:
+      PRIMARY_HOST: pg-primary
+      REPLICATION_PASSWORD: replicator
+      PGDATA: /var/lib/postgresql/data
+      # Applies changes 2 s late on purpose, so replication lag is visible.
+      REPLICA_APPLY_DELAY: ${REPLICA_APPLY_DELAY:-2s}
+    volumes:
+      - pg-replica:/var/lib/postgresql/data
+      - ./db/postgres/replica-entrypoint.sh:/replica-entrypoint.sh:ro
+    ports:
+      - "5435:5432"
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U pollpulse -d pollpulse"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+
+  # ------------------------------------------------------------------ MongoDB
+  cfg1:
+    <<: *mongod
+    command: ["mongod", "--configsvr", "--replSet", "cfgrs", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes: [cfg1:/data/configdb]
+
+  a1:
+    <<: *mongod
+    command: ["mongod", "--shardsvr", "--replSet", "shard-a", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes: [a1:/data/db]
+  a2:
+    <<: *mongod
+    command: ["mongod", "--shardsvr", "--replSet", "shard-a", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes: [a2:/data/db]
+  a3:
+    <<: *mongod
+    command: ["mongod", "--shardsvr", "--replSet", "shard-a", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes: [a3:/data/db]
+
+  b1:
+    <<: *mongod
+    command: ["mongod", "--shardsvr", "--replSet", "shard-b", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes: [b1:/data/db]
+  b2:
+    <<: *mongod
+    command: ["mongod", "--shardsvr", "--replSet", "shard-b", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes: [b2:/data/db]
+  b3:
+    <<: *mongod
+    command: ["mongod", "--shardsvr", "--replSet", "shard-b", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes: [b3:/data/db]
+
+  mongos:
+    image: mongo:7.0
+    restart: unless-stopped
+    command: ["mongos", "--configdb", "cfgrs/cfg1:27017", "--port", "27017", "--bind_ip_all"]
+    ports:
+      - "27020:27017"   # connect with: mongosh mongodb://localhost:27020
+    depends_on: [cfg1]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand({ ping: 1 }).ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # One-shot: initiates the replica sets, adds the shards, shards the collections.
+  mongo-init:
+    image: mongo:7.0
+    restart: "no"
+    entrypoint: ["bash", "/scripts/init-cluster.sh"]
+    volumes:
+      - ./db/mongo:/scripts:ro
+    depends_on:
+      cfg1: { condition: service_healthy }
+      a1: { condition: service_healthy }
+      a2: { condition: service_healthy }
+      a3: { condition: service_healthy }
+      b1: { condition: service_healthy }
+      b2: { condition: service_healthy }
+      b3: { condition: service_healthy }
+      mongos: { condition: service_started }
+
+  # ------------------------------------------------------------------ Redis
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ------------------------------------------------------------------ API (one per region)
+  api1:
+    <<: *api
+    environment:
+      <<: *api-env
+      INSTANCE_ID: api-1
+      REGION: mumbai
+  api2:
+    <<: *api
+    environment:
+      <<: *api-env
+      INSTANCE_ID: api-2
+      REGION: frankfurt
+  api3:
+    <<: *api
+    environment:
+      <<: *api-env
+      INSTANCE_ID: api-3
+      REGION: virginia
+
+  worker:
+    <<: *api
+    command: ["node", "src/worker.js"]
+    healthcheck:
+      disable: true
+    environment:
+      <<: *api-env
+      INSTANCE_ID: worker
+
+  # ------------------------------------------------------------------ Edge
+  nginx:
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+    restart: unless-stopped
+    environment:
+      NGINX_ENVSUBST_FILTER: "^EDGE_"
+      EDGE_RATE_LIMIT_RPS: ${EDGE_RATE_LIMIT_RPS:-100}
+      EDGE_RATE_LIMIT_BURST: ${EDGE_RATE_LIMIT_BURST:-200}
+    ports:
+      - "8080:80"
+    depends_on:
+      api1: { condition: service_healthy }
+      api2: { condition: service_healthy }
+      api3: { condition: service_healthy }
+
+  # ------------------------------------------------------------------ Load testing (on demand)
+  #   docker compose --profile loadtest run --rm k6 run /scripts/01-vote-storm.js
+  k6:
+    image: grafana/k6:1.3.0
+    profiles: ["loadtest"]
+    volumes:
+      - ./load-tests:/scripts:ro
+    environment:
+      BASE_URL: http://nginx
+
+volumes:
+  pg-primary:
+  pg-replica:
+  cfg1:
+  a1:
+  a2:
+  a3:
+  b1:
+  b2:
+  b3:
