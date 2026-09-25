@@ -590,8 +590,6 @@ flowchart LR
 
 ## 9. Live Dashboard
 
-Open **http://localhost:8080/#/dashboard** (no login needed). It updates every second:
-
 - 📈 **Votes per second**, in total and per region, for the last 60 seconds
 - 🔥 **Hottest poll**, with live results from the sharded counters
 - 🍃 **MongoDB cluster**: which member of each shard is PRIMARY, with health and lag per region
